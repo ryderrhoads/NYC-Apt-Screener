@@ -1,122 +1,261 @@
-import requests
+from patchright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-import re
+import json
 import csv
 import time
+import random
+import sys
+from pathlib import Path
 
-class StreetEasyScraper(): 
-    results = []
-    # developer tools -> network -> name=url -> request headers
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:99.0) Gecko/20100101 Firefox/99.0', 
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Cookie': '_gcl_au=1.1.1916908104.1653508835; _ga=GA1.2.1412812313.1653508835; _cc_id=3ab45dcc033a23615af701fe09fbaf7d; zjs_user_id=null; zg_anonymous_id="8d28abb4-9448-4ed8-b374-e279dfa9b225"; _actor=eyJpZCI6Im8zczIzQXNwN05NRitkMnQ1QXFKK1E9PSJ9--0ed896c538af8ff2741dbba91cd3174966055079; _se_t=536d4cc0-2dc8-4f05-99b2-988a81d7814f; _pxvid=f6c35dad-f1c8-11ec-84e1-4d4849796653; zjs_anonymous_id="536d4cc0-2dc8-4f05-99b2-988a81d7814f"; __gads=ID=cd1aad5016a699ef:T=1655860598:S=ALNI_MZPSfCP3Yc7vBjugiPVz4_iomDIQQ; ki_r=; KruxPixel=true; _gid=GA1.2.1605470631.1656354747; post_views=1; panoramaId_expiry=1657075579787; panoramaId=f61e0eed860097036a1f0e27b60f4945a7027fa039f7391d329199723062a46f; _uetsid=cf3f88d0f75511ec948f5108975040f9; _uetvid=2b79de20ac5611ecb0ff4b97fa7a171d',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'TE': 'trailers'
+
+class StreetEasyScraper:
+    def __init__(self, headless=True):
+        self.headless = headless
+        self.results = []
+        self.seen_urls = set()
+        Path("data").mkdir(exist_ok=True)
+        Path("debug").mkdir(exist_ok=True)
+        # Persistent profile so cookies/PX tokens survive between runs
+        self.profile_dir = Path(".browser_profile").resolve()
+        self.profile_dir.mkdir(exist_ok=True)
+
+    # ---------- timing ----------
+
+    def _sleep(self, lo=4, hi=10):
+        if random.random() < 0.15:
+            t = random.uniform(20, 45)
+        else:
+            t = random.uniform(lo, hi)
+        time.sleep(t)
+
+    def _human_scroll(self, page):
+        """Scroll in chunks to mimic reading and trigger lazy content."""
+        try:
+            for _ in range(random.randint(3, 6)):
+                page.mouse.wheel(0, random.randint(300, 700))
+                time.sleep(random.uniform(0.3, 0.9))
+        except Exception as e:
+            print(f"  scroll failed (page likely closed): {e}")
+            raise  # let run() handle recovery
+
+    # ---------- parsing ----------
+
+    def parse_next_data(self, html):
+        soup = BeautifulSoup(html, "lxml")
+        tag = soup.find("script", {"id": "__NEXT_DATA__"})
+        if not tag:
+            return None
+        try:
+            return json.loads(tag.string)
+        except Exception:
+            return None
+
+    def parse_jsonld(self, html):
+        soup = BeautifulSoup(html, "lxml")
+        scripts = soup.find_all("script", {"type": "application/ld+json"})
+        items = []
+        for s in scripts:
+            try:
+                d = json.loads(s.string)
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                items.extend(d.get("@graph", []))
+        return [i for i in items if i.get("@type") == "Apartment"]
+
+    def normalize(self, item):
+        addr = item.get("address", {})
+        geo = item.get("geo", {})
+        props = item.get("additionalProperty", [])
+        price = "NA"
+        for p in props:
+            if p.get("name") == "Monthly Rent":
+                price = p.get("value")
+        return {
+            "type": "rental",
+            "neighborhood": addr.get("addressLocality", "NA"),
+            "address": item.get("name", "NA"),
+            "price": price,
+            "geo": f"{geo.get('latitude')},{geo.get('longitude')}",
+            "beds": item.get("numberOfBedrooms", "NA"),
+            "baths": item.get("numberOfBathroomsTotal", "NA"),
+            "sqft": item.get("floorSize", {}).get("value", "NA"),
+            "url": item.get("url", "NA"),
         }
-    # default pages is 1
-    max_page = 1
-    
-    def fetch(self, url):
-        response = requests.get(url, headers=self.headers)
-        print(response)
-        return(response)
 
-    # parses the first webpage to find the total number of pages to be scraped
-    def parse_pagenum(self, response):
-        content = BeautifulSoup(response, features="lxml")
-        deck = content.find('ul', {'class': 'pagination-list-container'})
-        page_nums = []
-        for card in deck.select('li'): 
-            if card.a is not None: 
-                page = card.a.text if re.search("[0-9]", card.a.text) else 0
-            else: 
-                page = 0
-            
-            page_nums.append(page)
-        self.max_page = max([int(item) for item in page_nums])
-        print(self.max_page)
-    
-    # parses each page to pull type, beds, baths, url, etc. 
-    def parse(self, response):
-        content = BeautifulSoup(response, features="lxml")
-        deck = content.find('ul', {'class': 'searchCardList'})
+    def harvest(self, html, page_num):
+        """Extract new unique listings. Dump __NEXT_DATA__ for inspection."""
+        nd = self.parse_next_data(html)
+        if nd:
+            with open(f"debug/next_data_page{page_num}.json", "w") as f:
+                json.dump(nd, f, indent=2)
 
-        for card in deck.select('li'):
-            # type and neighborhood
-            type_neighborhood = card.find('div', {'class': 'listingCard listingCard--rentalCard jsItem'}).span.text
-            type = re.search("(.+) in", type_neighborhood).group(1) if re.search("(.+) in", type_neighborhood) else 'NA'
-            neigh = re.search("in (.+) at", type_neighborhood).group(1) if re.search("in (.+) at", type_neighborhood) else 'NA'
-            # address and url
-            address_url = card.find('address', {'class': 'listingCard-addressLabel listingCard-upperShortLabel'}) 
-            address = address_url.a.text if address_url else 'NA'
-            url = address_url.a['href'] if address_url else 'NA'
-            # price
-            price = card.find('div', {'class': 'listingCardBottom-emphasis'}).span.text if card.find('div', {'class': 'listingCardBottom-emphasis'}) else 'NA'
-            # lat/lon
-            geo = card.find('div', {'class': 'listingCard listingCard--rentalCard jsItem'}).a['se:map:point'] if card.find('div', {'class': 'listingCard listingCard--rentalCard jsItem'}) else 'NA'
-            # beds, baths, sqft
-            beds_bath_sqft = card.find_all('div', {'class': 'listingDetailDefinitionsItem'})
-            if len(beds_bath_sqft)==3:
-                beds = beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}).text if beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-                baths = beds_bath_sqft[1].find('span', {'class':'listingDetailDefinitionsText'}).text if beds_bath_sqft[1].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-                sqft = re.search("[0-9]+", beds_bath_sqft[2].find('span', {'class':'listingDetailDefinitionsText'}).text).group(0) if beds_bath_sqft[2].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-            elif len(beds_bath_sqft)==2:
-                beds = beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}).text if beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-                baths = beds_bath_sqft[1].find('span', {'class':'listingDetailDefinitionsText'}).text if beds_bath_sqft[1].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-                sqft = 'NA'
-            elif len(beds_bath_sqft)==1:
-                beds = beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}).text if beds_bath_sqft[0].find('span', {'class':'listingDetailDefinitionsText'}) else 'NA'
-                baths = 'NA', 
-                sqft = 'NA'
-            else:
-                beds = 'NA'
-                baths = 'NA'
-                sqft = 'NA'
+        added = 0
+        for item in self.parse_jsonld(html):
+            url = item.get("url", "")
+            if not url or url in self.seen_urls:
+                continue
+            self.seen_urls.add(url)
+            self.results.append(self.normalize(item))
+            added += 1
+        return added
 
-            # combine into dictionary
-            self.results.append({
-                    'type': type,
-                    'neighborhood': neigh,
-                    'address': address, 
-                    'price': price,
-                    'geo': geo,
-                    'beds': beds, 
-                    'baths': baths, 
-                    'sqft': sqft,
-                    'url': url
-            })
+    # ---------- output ----------
 
-    def to_csv(self):
-        with open('data/streeteasy.csv', 'w') as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=self.results[0].keys())
-            writer.writeheader()
+    def save(self):
+        if not self.results:
+            print("  nothing to save yet")
+            return
+        with open("data/streeteasy.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=self.results[0].keys())
+            w.writeheader()
+            w.writerows(self.results)
 
-            for row in self.results:
-                writer.writerow(row)
+    def get_next_page_url(self, html):
+        soup = BeautifulSoup(html, "lxml")
 
-    def run(self):
-        url = 'https://streeteasy.com/for-rent/nyc/price:-2400%7Carea:336,331,310,334,306,338,305,321,364,322,328,325,307,303,332,304,320,301,367,340,339,365,319,326,329,355,318,323,302,324,102,119,139,135,155,148,147,165,149,153,401,416,415,424,420,402,411,414,403,404%7Cbeds%3C=1%7Camenities:laundry?page=1'
-        res = self.fetch(url)
-        self.parse_pagenum(res.text)
-        time.sleep(3)
+        # 1. Try rel=next (rare but clean)
+        link = soup.find("link", {"rel": "next"})
+        if link and link.get("href"):
+            return "https://streeteasy.com" + link["href"]
 
-        for page in range(1,self.max_page + 1):
-            url = f'https://streeteasy.com/for-rent/nyc/price:-2400%7Carea:336,331,310,334,306,338,305,321,364,322,328,325,307,303,332,304,320,301,367,340,339,365,319,326,329,355,318,323,302,324,102,119,139,135,155,148,147,165,149,153,401,416,415,424,420,402,411,414,403,404%7Cbeds%3C=1%7Camenities:laundry?page={page}'
-            res = self.fetch(url)
-            self.parse(res.text)
-            time.sleep(3)
-        self.to_csv()
+        # 2. Correct selector (your case)
+        btn = soup.find("a", {"aria-labelledby": "next-arrow-label"})
+        if btn and btn.get("href"):
+            return "https://streeteasy.com" + btn["href"]
+
+        # 3. Backup: class-based (more brittle but useful)
+        btn = soup.select_one("a.NavigationArrow_arrowLink__jfaTM")
+        if btn and btn.get("href"):
+            return "https://streeteasy.com" + btn["href"]
+
+        return None
+    # ---------- driver ----------
+
+    def run(self, max_pages=50):
+        base_url = (
+            "https://streeteasy.com/for-rent/nyc/"
+            "price:-4000%7Carea:101,123,140,313,373,401,402,409,414,415,416,"
+            "417,418,419,420,428,431,451,453,454,455,459%7Cbeds:1%7C"
+            "in_rect:40.728,40.776,-73.881,-73.795%7C"
+            "amenities:elevator,parking,doorman%7Cpets:allowed"
+            "?sort_by=price_asc"
+        )
+
+        with sync_playwright() as pw:
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(self.profile_dir),
+                headless=self.headless,
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+                timezone_id="America/New_York",
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+
+            # Warmup — land on homepage, scroll, then navigate deeper.
+            print("Warmup...")
+            try:
+                resp = page.goto("https://streeteasy.com/",
+                                 wait_until="domcontentloaded", timeout=30000)
+                print(f"  homepage: {resp.status if resp else '?'}")
+                if resp and resp.status == 403:
+                    print("Blocked on homepage. Wait it out or change IP.")
+                    context.close()
+                    return
+            except Exception as e:
+                print(f"  homepage nav failed: {e}")
+                context.close()
+                return
+
+            self._sleep(3, 6)
+            try:
+                self._human_scroll(page)
+            except Exception:
+                pass
+
+            try:
+                page.goto("https://streeteasy.com/for-rent/nyc",
+                          wait_until="domcontentloaded", timeout=30000)
+                self._sleep(3, 6)
+                self._human_scroll(page)
+            except Exception as e:
+                print(f"  rentals landing nav/scroll failed: {e} — continuing anyway")
+            url= base_url
+            empty_streak = 0
+            for pnum in range(1, max_pages + 1):
+                next_url = self.get_next_page_url(html)
+                if not next_url:
+                    print("No next page found — stopping")
+                    break
+
+                url = next_url
+                print(f"Page {pnum}:")
+
+                html = None
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    status = resp.status if resp else None
+                    print(f"  status: {status}")
+                    if status == 403:
+                        print("  blocked mid-scrape — stopping")
+                        break
+
+                    self._sleep(2, 4)
+                    self._human_scroll(page)
+                    html = page.content()
+
+                except Exception as e:
+                    print(f"  page {pnum} failed: {e}")
+                    # Recover with a fresh tab in the same context
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    try:
+                        page = context.new_page()
+                        print("  opened fresh page, continuing to next iteration")
+                    except Exception as e2:
+                        print(f"  couldn't recover context: {e2} — stopping")
+                        break
+                    continue
+
+                if html is None:
+                    continue
+
+                with open(f"debug/page{pnum}.html", "w") as f:
+                    f.write(html)
+
+                added = self.harvest(html, pnum)
+                print(f"  +{added} new (total unique: {len(self.results)})")
+
+                # Save every page — crashes are cheap now
+                self.save()
+
+                if added == 0:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        print("Two pages with 0 new listings — stopping")
+                        break
+                else:
+                    empty_streak = 0
+
+                self._sleep(5, 12)
+
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        self.save()
+        print(f"Done. Saved {len(self.results)} unique listings to data/streeteasy.csv")
 
 
-    
-if __name__ == '__main__':
-    scraper = StreetEasyScraper()
-    scraper.run()
+if __name__ == "__main__":
+    headed = "--headed" in sys.argv
+    StreetEasyScraper(headless=not headed).run()

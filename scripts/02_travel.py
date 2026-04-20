@@ -2,6 +2,10 @@ import requests
 from requests.structures import CaseInsensitiveDict
 import pandas as pd
 import re
+from dotenv import load_dotenv
+import os
+load_dotenv(".env")
+apiKey = os.getenv("GEOAPIFY_API_KEY")
 
 # https://apidocs.geoapify.com/docs/geocoding/forward-geocoding/#about
 # https://apidocs.geoapify.com/playground/routing
@@ -36,7 +40,6 @@ class Routing():
             self.lines.append(line)
 
     def run(self):
-        apiKey = '5e77b7d1eb4941659372dc2532c8ebb4'
         mode = 'transit'
 
         dest_geos = {
